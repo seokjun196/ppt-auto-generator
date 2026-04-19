@@ -95,52 +95,90 @@ def get_font_size(val):
     except Exception:
         return None
 
-def apply_font_to_run(run, font_name, font_size):
-    """run에 폰트명과 크기를 적용."""
+# XML 네임스페이스
+_NSMAP = {
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+}
+_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+def _set_run_text_xml(run, text):
+    """
+    <a:t> 태그의 텍스트만 교체한다.
+    run.text = "..." 은 내부적으로 <a:r> 전체를 재구성해
+    <a:rPr>(폰트 정보)를 날릴 수 있으므로, XML을 직접 조작한다.
+    """
+    t_elem = run._r.find(f"{{{_A}}}t")
+    if t_elem is not None:
+        t_elem.text = text
+    else:
+        # <a:t>가 없는 경우 새로 생성
+        import lxml.etree as etree
+        t_elem = etree.SubElement(run._r, f"{{{_A}}}t")
+        t_elem.text = text
+
+def _set_run_font_xml(run, font_name, font_size):
+    """
+    <a:rPr> 속성을 직접 수정해 폰트명·크기를 적용한다.
+    없으면 새로 생성해서 <a:r>의 첫 번째 자식으로 삽입한다.
+    font_size는 python-pptx Pt() 값(EMU 단위)이며,
+    OOXML sz 속성은 '포인트 × 100' 정수값이다.
+    """
+    import lxml.etree as etree
+
+    rPr = run._r.find(f"{{{_A}}}rPr")
+    if rPr is None:
+        rPr = etree.Element(f"{{{_A}}}rPr")
+        run._r.insert(0, rPr)   # <a:rPr>은 <a:r>의 첫 번째 자식이어야 함
+
     if font_name:
-        run.font.name = font_name
+        # <a:latin typeface="..."/> 처리
+        latin = rPr.find(f"{{{_A}}}latin")
+        if latin is None:
+            latin = etree.SubElement(rPr, f"{{{_A}}}latin")
+        latin.set("typeface", font_name)
+
     if font_size:
-        run.font.size = font_size
+        # sz 속성: 포인트의 100배 정수 (예: 24pt → "2400")
+        sz_val = str(int(round(font_size.pt * 100)))
+        rPr.set("sz", sz_val)
 
 def merge_and_replace_para(para, mapping):
     """
     paragraph 안의 run들을 하나로 합친 뒤 플레이스홀더를 치환한다.
-    run이 여러 개로 쪼개져 있어도 올바르게 동작한다.
-    치환이 발생한 경우 True를 반환한다.
+    - run.text = ... 대신 XML <a:t> 직접 교체 → <a:rPr> 보존
+    - 폰트도 <a:rPr> XML 직접 수정 → 덮어쓰기 없음
     """
     if not para.runs:
         return False
 
-    # 1) 현재 paragraph의 전체 텍스트(run 합산) 확인
+    # 1) paragraph 전체 텍스트 합산
     combined_text = "".join(r.text for r in para.runs)
     if not PLACEHOLDER_PATTERN.search(combined_text):
         return False
 
-    # 2) 치환할 key 파악 (이 paragraph에 어떤 플레이스홀더가 있는지)
-    found_keys = PLACEHOLDER_PATTERN.findall(combined_text)
+    # 2) 어떤 플레이스홀더가 있는지 파악
+    found_keys = list(dict.fromkeys(PLACEHOLDER_PATTERN.findall(combined_text)))  # 순서 유지·중복 제거
 
-    # 3) run들을 첫 번째 run으로 병합
+    # 3) 첫 번째 run에 합산 텍스트를 XML 레벨로 넣고, 나머지 run은 비움
     first_run = para.runs[0]
-    first_run.text = combined_text
+    _set_run_text_xml(first_run, combined_text)
     for r in para.runs[1:]:
-        r.text = ""
+        _set_run_text_xml(r, "")
 
-    # 4) 텍스트 치환
-    new_text = first_run.text
-    for key in dict.fromkeys(found_keys):   # 순서 유지, 중복 제거
+    # 4) 텍스트 치환 (XML 레벨)
+    new_text = combined_text
+    for key in found_keys:
         info = mapping.get(key)
         if info is None:
             continue
-        placeholder = f"{{{key}}}"
-        new_text = new_text.replace(placeholder, info["value"])
-    first_run.text = new_text
+        new_text = new_text.replace(f"{{{key}}}", info["value"])
+    _set_run_text_xml(first_run, new_text)
 
-    # 5) 폰트 적용: 치환된 key 중 마지막 key의 폰트를 우선 적용
-    #    (같은 run에 {직책}·{이름}이 동시에 있는 경우는 드물지만 방어 처리)
+    # 5) 폰트 적용 — XML <a:rPr> 직접 수정 (텍스트 교체와 완전히 분리)
     for key in found_keys:
         info = mapping.get(key)
         if info:
-            apply_font_to_run(first_run, info.get("font_name"), info.get("font_size"))
+            _set_run_font_xml(first_run, info.get("font_name"), info.get("font_size"))
 
     return True
 
@@ -202,36 +240,17 @@ def generate_ppt(prs_template: Presentation, df: pd.DataFrame) -> bytes:
         blank_layout = prs_out.slide_layouts[6]  # blank
         new_slide = prs_out.slides.add_slide(blank_layout)
 
-        # 템플릿 슬라이드의 XML을 깊게 복사해 새 슬라이드에 붙여넣기
-        template_xml = copy.deepcopy(template_slide._element)
+        # ── spTree 전체를 한 번에 deepcopy → 완전히 독립된 XML 트리 ──────
+        # 자식 단위 deepcopy는 lxml 내부 참조가 공유되어
+        # 두 번째 글상자 이후 치환이 첫 번째 슬라이드에도 반영되는 버그 발생.
+        # spTree 전체를 한 번에 deepcopy해야 슬라이드마다 완전히 격리된다.
+        cloned_sp_tree = copy.deepcopy(template_slide._element.spTree)
 
-        # spTree(shape tree) 복사
-        new_sp_tree = new_slide._element.spTree
-        template_sp_tree = template_xml.find(
-            ".//{http://schemas.openxmlformats.org/presentationml/2006/main}cSld"
-            "/{http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing}"
-            "spTree"
-        )
-
-        # namespace-aware 방법으로 spTree 가져오기
-        PML_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
-        DML_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
-
-        cSld = template_xml.find(f"{{{PML_NS}}}cSld")
-        if cSld is None:
-            # 네임스페이스 없이 시도
-            cSld = template_xml.find("cSld")
-
-        # spTree를 직접 복사
-        src_sp_tree = new_slide._element.spTree
-        # 기존 요소 제거
-        for child in list(src_sp_tree):
-            src_sp_tree.remove(child)
-
-        # 템플릿 슬라이드의 spTree 자식들 복사
-        orig_sp_tree = template_slide._element.spTree
-        for child in orig_sp_tree:
-            src_sp_tree.append(copy.deepcopy(child))
+        dst_sp_tree = new_slide._element.spTree
+        for child in list(dst_sp_tree):   # 기존 요소 전체 제거
+            dst_sp_tree.remove(child)
+        for child in list(cloned_sp_tree):  # 독립 복사본 삽입
+            dst_sp_tree.append(child)
 
         # 이미지 관계(rId) 복사: 템플릿의 미디어를 새 슬라이드에 등록
         for rel in template_slide.part.rels.values():
