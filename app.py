@@ -95,51 +95,78 @@ def get_font_size(val):
     except Exception:
         return None
 
-def replace_text_in_run(run, mapping):
-    """run 안의 {직책}/{이름}을 치환하고 폰트를 적용."""
-    text = run.text
-    for key, info in mapping.items():
+def apply_font_to_run(run, font_name, font_size):
+    """run에 폰트명과 크기를 적용."""
+    if font_name:
+        run.font.name = font_name
+    if font_size:
+        run.font.size = font_size
+
+def merge_and_replace_para(para, mapping):
+    """
+    paragraph 안의 run들을 하나로 합친 뒤 플레이스홀더를 치환한다.
+    run이 여러 개로 쪼개져 있어도 올바르게 동작한다.
+    치환이 발생한 경우 True를 반환한다.
+    """
+    if not para.runs:
+        return False
+
+    # 1) 현재 paragraph의 전체 텍스트(run 합산) 확인
+    combined_text = "".join(r.text for r in para.runs)
+    if not PLACEHOLDER_PATTERN.search(combined_text):
+        return False
+
+    # 2) 치환할 key 파악 (이 paragraph에 어떤 플레이스홀더가 있는지)
+    found_keys = PLACEHOLDER_PATTERN.findall(combined_text)
+
+    # 3) run들을 첫 번째 run으로 병합
+    first_run = para.runs[0]
+    first_run.text = combined_text
+    for r in para.runs[1:]:
+        r.text = ""
+
+    # 4) 텍스트 치환
+    new_text = first_run.text
+    for key in dict.fromkeys(found_keys):   # 순서 유지, 중복 제거
+        info = mapping.get(key)
+        if info is None:
+            continue
         placeholder = f"{{{key}}}"
-        if placeholder in text:
-            text = text.replace(placeholder, info["value"])
-            # 폰트 적용
-            if info.get("font_name"):
-                run.font.name = info["font_name"]
-            if info.get("font_size"):
-                run.font.size = info["font_size"]
-    run.text = text
+        new_text = new_text.replace(placeholder, info["value"])
+    first_run.text = new_text
+
+    # 5) 폰트 적용: 치환된 key 중 마지막 key의 폰트를 우선 적용
+    #    (같은 run에 {직책}·{이름}이 동시에 있는 경우는 드물지만 방어 처리)
+    for key in found_keys:
+        info = mapping.get(key)
+        if info:
+            apply_font_to_run(first_run, info.get("font_name"), info.get("font_size"))
+
+    return True
 
 def fill_slide(slide, mapping):
-    """슬라이드 내 모든 텍스트프레임의 플레이스홀더를 치환."""
+    """
+    슬라이드 내 모든 텍스트프레임의 플레이스홀더를 치환한다.
+    - shape이 몇 개든 상관없이 전부 순회
+    - 한 shape 안에 동일 플레이스홀더가 여러 paragraph에 있어도 모두 처리
+    - run이 쪼개져 있어도 paragraph 단위로 병합 후 치환
+    """
     for shape in slide.shapes:
         if not shape.has_text_frame:
             continue
 
-        tf = shape.text_frame
-        # 슬라이드에 {직책} 또는 {이름} 이 있는지 먼저 확인
-        full_text = "".join(run.text for para in tf.paragraphs for run in para.runs)
-        if not PLACEHOLDER_PATTERN.search(full_text):
+        # shape 전체 텍스트에 플레이스홀더가 있는지 빠르게 확인
+        shape_full_text = "".join(
+            r.text
+            for para in shape.text_frame.paragraphs
+            for r in para.runs
+        )
+        if not PLACEHOLDER_PATTERN.search(shape_full_text):
             continue
 
-        for para in tf.paragraphs:
-            # paragraph 레벨에서 합쳐진 텍스트 확인
-            para_text = "".join(r.text for r in para.runs)
-            if not PLACEHOLDER_PATTERN.search(para_text):
-                continue
-
-            # run이 분리된 경우 합쳐서 처리
-            if len(para.runs) > 1:
-                combined = "".join(r.text for r in para.runs)
-                if PLACEHOLDER_PATTERN.search(combined):
-                    # 첫 번째 run에 모아서 처리, 나머지 비움
-                    first_run = para.runs[0]
-                    first_run.text = combined
-                    for r in para.runs[1:]:
-                        r.text = ""
-                    replace_text_in_run(first_run, mapping)
-            else:
-                for run in para.runs:
-                    replace_text_in_run(run, mapping)
+        # paragraph 단위로 처리 (한 shape 안에 여러 paragraph가 있어도 모두 처리)
+        for para in shape.text_frame.paragraphs:
+            merge_and_replace_para(para, mapping)
 
 def generate_ppt(prs_template: Presentation, df: pd.DataFrame) -> bytes:
     """
